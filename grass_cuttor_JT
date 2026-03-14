@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+
+import asyncio
+import websockets
+import time
+from datetime import datetime
+
+
+# ================= SAFE GPIO =================
+try:
+    import RPi.GPIO as GPIO
+    IS_PI = True
+except:
+    print("No GPIO (Windows mode)")
+    IS_PI = False
+
+
+# ================= SAFE CAMERA =================
+try:
+    from picamera2 import Picamera2
+    import cv2
+    import numpy as np
+    CAMERA_OK = True
+except:
+    print("No Camera")
+    CAMERA_OK = False
+
+
+# ================= LOG =================
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+# ================= GPIO PINS =================
+ESC_LEFT = 18
+ESC_RIGHT = 19
+ESC_CUTTER = 13
+
+
+# ================= ESC SETTINGS =================
+NEUTRAL_LEFT = 7.5
+NEUTRAL_RIGHT = 7.5
+NEUTRAL_CUTTER = 7.5
+
+STOP = 5.0
+MAX_DUTY = 10.0
+DEAD_ZONE = 0.08
+
+
+# ================= CUTTER SPEEDS =================
+CUTTER_MED = NEUTRAL_CUTTER + 0.6
+CUTTER_HIGH = NEUTRAL_CUTTER + 1.2
+
+
+# ================= RAMP =================
+RAMP_STEP = 3
+RAMP_INTERVAL = 0.05
+
+CUTTER_RAMP_STEP = 0.05
+CUTTER_RAMP_INTERVAL = 0.05
+
+
+# ================= STATE =================
+speed_limit = 100
+
+target_left = 0
+target_right = 0
+
+current_left = 0
+current_right = 0
+
+cutter_target = STOP
+cutter_current = STOP
+
+
+# ================= GPIO SETUP =================
+if IS_PI:
+
+    GPIO.setmode(GPIO.BCM)
+
+    for pin in (ESC_LEFT, ESC_RIGHT, ESC_CUTTER):
+        GPIO.setup(pin, GPIO.OUT)
+
+    pwm_left = GPIO.PWM(ESC_LEFT, 50)
+    pwm_right = GPIO.PWM(ESC_RIGHT, 50)
+    pwm_cutter = GPIO.PWM(ESC_CUTTER, 50)
+
+    pwm_left.start(NEUTRAL_LEFT)
+    pwm_right.start(NEUTRAL_RIGHT)
+    pwm_cutter.start(STOP)
+
+
+# ================= ARM =================
+def arm_esc(pwm, neutral, name):
+
+    log(f"Arming {name}")
+
+    pwm.ChangeDutyCycle(STOP)
+    time.sleep(1.5)
+
+    pwm.ChangeDutyCycle(neutral)
+    time.sleep(2)
+
+    log(f"{name} armed")
+
+
+if IS_PI:
+
+    arm_esc(pwm_left, NEUTRAL_LEFT, "LEFT")
+    arm_esc(pwm_right, NEUTRAL_RIGHT, "RIGHT")
+    arm_esc(pwm_cutter, NEUTRAL_CUTTER, "CUTTER")
+
+
+# ================= HELPERS =================
+def motor_to_duty(value, neutral):
+
+    value = max(-100, min(100, value))
+
+    duty = neutral + (value / 100.0) * 2.5
+
+    if abs(duty - neutral) < DEAD_ZONE:
+        duty = neutral
+
+    return max(STOP, min(MAX_DUTY, duty))
+
+
+def stop_all():
+
+    global cutter_current, cutter_target
+
+    if IS_PI:
+
+        pwm_left.ChangeDutyCycle(NEUTRAL_LEFT)
+        pwm_right.ChangeDutyCycle(NEUTRAL_RIGHT)
+
+        pwm_cutter.ChangeDutyCycle(STOP)
+
+    cutter_current = STOP
+    cutter_target = STOP
+
+    log("STOP ALL")
+
+
+# ================= RAMP TASK =================
+async def motor_ramp_task():
+
+    global current_left, current_right
+
+    while True:
+
+        await asyncio.sleep(RAMP_INTERVAL)
+
+        if current_left < target_left:
+            current_left += min(RAMP_STEP, target_left - current_left)
+
+        elif current_left > target_left:
+            current_left -= min(RAMP_STEP, current_left - target_left)
+
+        if current_right < target_right:
+            current_right += min(RAMP_STEP, target_right - current_right)
+
+        elif current_right > target_right:
+            current_right -= min(RAMP_STEP, current_right - target_right)
+
+        if IS_PI:
+
+            pwm_left.ChangeDutyCycle(
+                motor_to_duty(current_left, NEUTRAL_LEFT)
+            )
+
+            pwm_right.ChangeDutyCycle(
+                motor_to_duty(current_right, NEUTRAL_RIGHT)
+            )
+
+
+async def cutter_ramp_task():
+
+    global cutter_current
+
+    while True:
+
+        await asyncio.sleep(CUTTER_RAMP_INTERVAL)
+
+        if cutter_current < cutter_target:
+            cutter_current = min(
+                cutter_current + CUTTER_RAMP_STEP,
+                cutter_target,
+            )
+
+        elif cutter_current > cutter_target:
+            cutter_current = max(
+                cutter_current - CUTTER_RAMP_STEP,
+                cutter_target,
+            )
+
+        if IS_PI:
+            pwm_cutter.ChangeDutyCycle(cutter_current)
+
+
+# ================= CAMERA =================
+if CAMERA_OK:
+
+    picam2 = Picamera2()
+
+    cam_config = picam2.create_video_configuration(
+        main={"size": (640, 480), "format": "RGB888"}
+    )
+
+    picam2.configure(cam_config)
+    picam2.start()
+
+
+# ================= CAMERA WS =================
+async def camera_handler(ws):
+
+    log("Camera connected")
+
+    if not CAMERA_OK:
+        return
+
+    try:
+
+        while True:
+
+            frame = picam2.capture_array()
+
+            _, jpg = cv2.imencode(
+                ".jpg",
+                frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 70],
+            )
+
+            await ws.send(jpg.tobytes())
+
+            await asyncio.sleep(0.05)
+
+    except Exception as e:
+
+        log(f"Camera error {e}")
+
+
+# ================= CONTROL WS =================
+async def control_handler(ws):
+
+    global speed_limit
+    global target_left, target_right
+    global cutter_target
+
+    log("Control connected")
+
+    try:
+
+        async for msg in ws:
+
+            log(msg)
+
+            if msg.startswith("MOTOR:"):
+
+                try:
+
+                    data = msg.replace("MOTOR:", "")
+
+                    l, r = map(int, data.split(","))
+
+                    target_left = int(
+                        l * speed_limit / 100
+                    )
+
+                    target_right = int(
+                        -r * speed_limit / 100
+                    )
+
+                except:
+                    log("Bad MOTOR")
+
+            elif msg.startswith("SPD:"):
+
+                speed_limit = int(
+                    msg.split(":")[1]
+                )
+
+                speed_limit = max(
+                    0, min(100, speed_limit)
+                )
+
+            elif msg == "CUT:OFF":
+                cutter_target = STOP
+
+            elif msg == "CUT:MED":
+                cutter_target = CUTTER_MED
+
+            elif msg == "CUT:HIGH":
+                cutter_target = CUTTER_HIGH
+
+            elif msg == "STOP":
+
+                target_left = 0
+                target_right = 0
+                cutter_target = STOP
+
+    finally:
+
+        stop_all()
+        log("Control disconnected")
+
+
+# ================= MAIN =================
+async def main():
+
+    log("WS 8765 / 8766")
+
+    asyncio.create_task(motor_ramp_task())
+    asyncio.create_task(cutter_ramp_task())
+
+    async with websockets.serve(
+        control_handler,
+        "0.0.0.0",
+        8765,
+    ):
+
+        async with websockets.serve(
+            camera_handler,
+            "0.0.0.0",
+            8766,
+        ):
+
+            await asyncio.Future()
+
+
+try:
+
+    asyncio.run(main())
+
+finally:
+
+    stop_all()
+
+    if CAMERA_OK:
+        try:
+            picam2.stop()
+        except:
+            pass
+
+    if IS_PI:
+        GPIO.cleanup()
